@@ -7,6 +7,16 @@ use bevy::{
     sprite_render::{Material2d, Material2dPlugin},
 };
 
+mod cell;
+mod gpu_cell;
+mod grid_state;
+mod formula;
+mod evaluator;
+mod demo;
+
+use grid_state::GridState;
+use evaluator::{TickControl, EvaluationTimer, tick_evaluation_system};
+
 const GRID_COLS: i32 = 128;
 const GRID_ROWS: i32 = 128;
 
@@ -16,15 +26,22 @@ fn main() {
         DefaultPlugins,
         Material2dPlugin::<SpreadsheetGridMaterial>::default(),
     ))
-    .insert_resource(GridState {
-        cells: vec![0u32; (GRID_COLS * GRID_ROWS) as usize],
+    .insert_resource({
+        let mut grid = GridState::new(GRID_COLS, GRID_ROWS);
+        demo::setup_demo_data(&mut grid);
+        grid
     })
     .insert_resource(DragState::default())
+    .insert_resource(TickControl::default())
+    .insert_resource(EvaluationTimer::default())
     .add_systems(Startup, (setup, setup_ui))
     .add_systems(Update, (
+        tick_evaluation_system,
         update_grid_to_camera,
         grid_interaction,
         handle_camera_buttons,
+        handle_tick_buttons,
+        update_tick_button_text,
         handle_keyboard_input,
         apply_camera_actions,
         sync_grid_buffer
@@ -32,11 +49,6 @@ fn main() {
     app.run();
 }
 
-// CPU-side source of truth for cell data
-#[derive(Resource)]
-struct GridState {
-    cells: Vec<u32>, // 0 = empty, 1 = selected, 2 = heat
-}
 
 // Track drag state to toggle cells only once per drag
 #[derive(Resource, Default)]
@@ -103,15 +115,22 @@ enum CameraButton {
     Reset,
 }
 
+#[derive(Component)]
+enum TickButton {
+    ManualTick,
+    AutoTickToggle,
+}
+
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    grid_state: Res<GridState>,
 ) {
     commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 0.0)));
 
-    let initial_data = vec![0u32; (GRID_COLS * GRID_ROWS) as usize];
+    let initial_data = grid_state.to_gpu_cells();
     let buffer_handle = buffers.add(ShaderStorageBuffer::from(initial_data));
 
     commands.spawn((
@@ -204,14 +223,12 @@ fn grid_interaction(
                 if !drag_state.toggled_cells.contains(&cell_coord) {
                     drag_state.toggled_cells.insert(cell_coord);
 
-                    let index = (row * GRID_COLS + col) as usize;
-
-                    // Toggle cell state
-                    grid_state.cells[index] = match grid_state.cells[index] {
-                        0 => 1,
-                        1 => 2,
-                        _ => 0,
-                    };
+                    // Toggle selection state
+                    if grid_state.selected.contains(&cell_coord) {
+                        grid_state.selected.remove(&cell_coord);
+                    } else {
+                        grid_state.selected.insert(cell_coord);
+                    }
                 }
             }
         }
@@ -229,7 +246,7 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            // Left panel - Zoom controls
+            // Left panel - Zoom and Tick controls
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
@@ -240,6 +257,16 @@ fn setup_ui(mut commands: Commands) {
                     create_button(parent, "Zoom In (+)", CameraButton::ZoomIn);
                     create_button(parent, "Zoom Out (-)", CameraButton::ZoomOut);
                     create_button(parent, "Reset", CameraButton::Reset);
+
+                    // Separator
+                    parent.spawn(Node {
+                        height: Val::Px(20.0),
+                        ..default()
+                    });
+
+                    // Tick controls
+                    create_tick_button(parent, "Tick", TickButton::ManualTick);
+                    create_tick_button(parent, "Auto Tick: OFF", TickButton::AutoTickToggle);
                 });
 
             // Right panel - Pan controls
@@ -293,6 +320,30 @@ fn create_button(parent: &mut ChildSpawnerCommands, label: &str, button_type: Ca
         ));
 }
 
+fn create_tick_button(parent: &mut ChildSpawnerCommands, label: &str, button_type: TickButton) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(120.0),
+                height: Val::Px(40.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.2, 0.5, 0.2)),
+            button_type,
+        ))
+        .with_child((
+            Text::new(label),
+            TextFont {
+                font_size: 14.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+        ));
+}
+
 fn handle_camera_buttons(
     interaction_query: Query<
         (&Interaction, &CameraButton),
@@ -312,6 +363,51 @@ fn handle_camera_buttons(
                 CameraButton::Reset => CameraAction::Reset,
             };
             commands.spawn(action);
+        }
+    }
+}
+
+fn handle_tick_buttons(
+    interaction_query: Query<
+        (&Interaction, &TickButton),
+        Changed<Interaction>,
+    >,
+    mut tick_control: ResMut<TickControl>,
+) {
+    for (interaction, button_type) in &interaction_query {
+        if *interaction == Interaction::Pressed {
+            match button_type {
+                TickButton::ManualTick => {
+                    tick_control.manual_tick_requested = true;
+                }
+                TickButton::AutoTickToggle => {
+                    tick_control.auto_tick_enabled = !tick_control.auto_tick_enabled;
+                }
+            }
+        }
+    }
+}
+
+fn update_tick_button_text(
+    tick_control: Res<TickControl>,
+    mut button_query: Query<(&TickButton, &Children)>,
+    mut text_query: Query<&mut Text>,
+) {
+    if !tick_control.is_changed() {
+        return;
+    }
+
+    for (button_type, children) in &mut button_query {
+        if let TickButton::AutoTickToggle = button_type {
+            for child in children {
+                if let Ok(mut text) = text_query.get_mut(*child) {
+                    **text = if tick_control.auto_tick_enabled {
+                        "Auto Tick: ON".to_string()
+                    } else {
+                        "Auto Tick: OFF".to_string()
+                    };
+                }
+            }
         }
     }
 }
@@ -396,7 +492,8 @@ fn sync_grid_buffer(
     let Ok(grid_handle) = grid_q.single() else { return };
     if let Some(mat) = materials.get(grid_handle) {
         if let Some(buffer) = buffers.get_mut(&mat.cell_data) {
-            buffer.set_data(grid_state.cells.as_slice());
+            let gpu_data = grid_state.to_gpu_cells();
+            buffer.set_data(gpu_data.as_slice());
         }
     }
 }

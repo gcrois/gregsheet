@@ -2264,6 +2264,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "evalexpr"
+version = "13.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25929004897f2bbab309121a60400d36992f6d911d09baa6c172f6cc55706601"
+
+[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2487,7 +2493,7 @@ dependencies = [
  "vec_map",
  "wasm-bindgen",
  "web-sys",
- "windows 0.58.0",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -2632,8 +2638,10 @@ name = "gregsheet"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "console_error_panic_hook",
  "env_logger",
+ "evalexpr",
 ]
 
 [[package]]
