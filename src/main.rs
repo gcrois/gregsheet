@@ -13,8 +13,12 @@ mod grid_state;
 mod formula;
 mod evaluator;
 mod demo;
+mod svg_renderer;
 
 use grid_state::GridState;
+use svg_renderer::{SvgRenderer, SvgRenderRequest};
+use bevy::render::render_resource::{TextureDimension, TextureFormat, Extent3d};
+use bevy::asset::RenderAssetUsages;
 use evaluator::{TickControl, EvaluationTimer, tick_evaluation_system};
 
 const GRID_COLS: i32 = 128;
@@ -30,8 +34,11 @@ fn main() {
         let mut grid = GridState::new(GRID_COLS, GRID_ROWS);
         demo::setup_demo_data(&mut grid);
         grid
-    })
-    .insert_resource(DragState::default())
+    });
+
+    app.insert_resource(SvgRenderer::new());
+
+    app.insert_resource(DragState::default())
     .insert_resource(TickControl::default())
     .insert_resource(EvaluationTimer::default())
     .add_systems(Startup, (setup, setup_ui))
@@ -46,6 +53,9 @@ fn main() {
         apply_camera_actions,
         sync_grid_buffer
     ));
+
+    app.add_systems(Update, manage_svg_cells);
+
     app.run();
 }
 
@@ -76,6 +86,11 @@ struct SpreadsheetGridMaterial {
     grid_dimensions: Vec2,
     #[storage(1, read_only)]
     cell_data: Handle<ShaderStorageBuffer>,
+    #[texture(2, dimension = "2d_array")]
+    #[sampler(3)]
+    rich_cell_textures: Handle<Image>,
+    #[storage(4, read_only)]
+    rich_cell_indices: Handle<ShaderStorageBuffer>,
 }
 
 impl Material2d for SpreadsheetGridMaterial {
@@ -125,6 +140,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     grid_state: Res<GridState>,
 ) {
@@ -132,6 +148,24 @@ fn setup(
 
     let initial_data = grid_state.to_gpu_cells();
     let buffer_handle = buffers.add(ShaderStorageBuffer::from(initial_data));
+
+    // Initialize rich cell indices with -1
+    let indices = vec![-1i32; (GRID_COLS * GRID_ROWS) as usize];
+    let indices_handle = buffers.add(ShaderStorageBuffer::from(indices));
+
+    // Initialize dummy texture array (1x1, 2 layers to force D2Array view)
+    let dummy_texture = Image::new(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 2,
+        },
+        TextureDimension::D2,
+        vec![0, 0, 0, 0, 0, 0, 0, 0], // Transparent (2 pixels)
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    let texture_handle = images.add(dummy_texture);
 
     commands.spawn((
         Mesh2d(meshes.add(Rectangle::new(1.0, 1.0))),
@@ -144,6 +178,8 @@ fn setup(
             color_line: LinearRgba::gray(0.8),
             grid_dimensions: Vec2::new(GRID_COLS as f32, GRID_ROWS as f32),
             cell_data: buffer_handle,
+            rich_cell_textures: texture_handle,
+            rich_cell_indices: indices_handle,
         })),
         Transform::from_xyz(0.0, 0.0, -100.0),
         GridBackdrop,
@@ -494,6 +530,125 @@ fn sync_grid_buffer(
         if let Some(buffer) = buffers.get_mut(&mat.cell_data) {
             let gpu_data = grid_state.to_gpu_cells();
             buffer.set_data(gpu_data.as_slice());
+        }
+    }
+}
+
+fn manage_svg_cells(
+    mut svg_renderer: ResMut<SvgRenderer>,
+    grid_state: Res<GridState>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    grid_q: Query<&MeshMaterial2d<SpreadsheetGridMaterial>>,
+    mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut last_visible_rich_cells: Local<Vec<(i32, i32)>>,
+) {
+    let Ok((camera, cam_transform)) = camera_q.single() else { return };
+    let Ok(grid_handle) = grid_q.single() else { return };
+    let Some(mat) = materials.get_mut(grid_handle) else { return };
+
+    let Some(rect) = camera.logical_viewport_rect() else { return };
+    let min_world = camera.viewport_to_world_2d(cam_transform, rect.min).ok();
+    let max_world = camera.viewport_to_world_2d(cam_transform, rect.max).ok();
+
+    let mut current_visible_rich_cells = Vec::new();
+
+    if let (Some(min), Some(max)) = (min_world, max_world) {
+        let bottom_left = Vec2::new(min.x.min(max.x), min.y.min(max.y));
+        let top_right = Vec2::new(min.x.max(max.x), min.y.max(max.y));
+
+        let min_col = (bottom_left.x / mat.cell_size.x).floor() as i32;
+        let max_col = (top_right.x / mat.cell_size.x).ceil() as i32;
+        let min_row = (-top_right.y / mat.cell_size.y).floor() as i32;
+        let max_row = (-bottom_left.y / mat.cell_size.y).ceil() as i32;
+
+        // Iterate visible cells
+        for row in min_row..=max_row {
+            for col in min_col..=max_col {
+                if col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS {
+                    continue;
+                }
+                
+                if let Some(cell) = grid_state.get_cell(col, row) {
+                     if let Some(svg) = &cell.svg_content {
+                         current_visible_rich_cells.push((col, row));
+
+                         let hash = if let Some(h) = cell.content_hash {
+                             h
+                         } else {
+                             seahash::hash(svg.as_bytes())
+                         };
+
+                         if !svg_renderer.is_cached(hash) {
+                             svg_renderer.request_render(SvgRenderRequest {
+                                 cell_coord: (col, row),
+                                 svg: svg.clone(),
+                                 width: 80,
+                                 height: 30,
+                                 content_hash: hash,
+                             });
+                         }
+                     }
+                }
+            }
+        }
+    }
+
+    let results = svg_renderer.poll_results();
+    let results_received = !results.is_empty();
+    
+    // Sort to ensure stable order for comparison
+    current_visible_rich_cells.sort();
+
+    let visibility_changed = *last_visible_rich_cells != current_visible_rich_cells;
+
+    if results_received || visibility_changed {
+        *last_visible_rich_cells = current_visible_rich_cells.clone();
+
+        // Rebuild Texture2DArray
+        // Only include cells that are visible AND have cached data
+        let mut texture_data = Vec::new();
+        let mut index_map = vec![-1i32; (GRID_COLS * GRID_ROWS) as usize];
+        let mut layer_count = 0;
+
+        for (col, row) in &current_visible_rich_cells {
+            if let Some(cell) = grid_state.get_cell(*col, *row) {
+                if let Some(svg) = &cell.svg_content {
+                    let hash = cell.content_hash.unwrap_or_else(|| seahash::hash(svg.as_bytes()));
+                    
+                    if let Some(buffer) = svg_renderer.pixel_cache.get(&hash) {
+                         texture_data.extend_from_slice(buffer);
+                         
+                         let cell_idx = (row * GRID_COLS + col) as usize;
+                         index_map[cell_idx] = layer_count;
+                         layer_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Always update index buffer
+        if let Some(buffer) = buffers.get_mut(&mat.rich_cell_indices) {
+             buffer.set_data(index_map.as_slice());
+        }
+
+        if layer_count > 0 {
+             let texture_array = Image::new(
+                Extent3d {
+                    width: 80,
+                    height: 30,
+                    depth_or_array_layers: layer_count as u32,
+                },
+                TextureDimension::D2,
+                texture_data,
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::RENDER_WORLD, // Only needed on GPU
+            );
+            
+            mat.rich_cell_textures = images.add(texture_array);
+        } else {
+            // Keep dummy texture if no layers
         }
     }
 }

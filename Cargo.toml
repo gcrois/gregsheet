@@ -10,6 +10,13 @@ env_logger = "0.11.8"
 evalexpr = "13.1.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 
+# Rich HTML cell rendering (SVG-based approach)
+resvg = "0.44"
+tiny-skia = "0.11"
+usvg = "0.44"
+crossbeam-channel = "0.5"
+seahash = "4.1"
+
 [profile.dev]
 opt-level = 1
 

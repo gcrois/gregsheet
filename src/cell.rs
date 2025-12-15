@@ -9,6 +9,10 @@ pub struct Cell {
     pub is_formula: bool,
     /// True if evalexpr returned an error
     pub error: bool,
+    /// Optional SVG content to be rendered
+    pub svg_content: Option<String>,
+    /// Hash of the SVG content for caching
+    pub content_hash: Option<u64>,
 }
 
 impl Default for Cell {
@@ -18,6 +22,8 @@ impl Default for Cell {
             value: 0,
             is_formula: false,
             error: false,
+            svg_content: None,
+            content_hash: None,
         }
     }
 }
@@ -31,6 +37,8 @@ impl Cell {
             value: 0,
             is_formula,
             error: false,
+            svg_content: None,
+            content_hash: None,
         }
     }
 

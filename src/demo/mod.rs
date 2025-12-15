@@ -46,4 +46,24 @@ pub fn setup_demo_data(grid: &mut GridState) {
             cell.set_raw(i.to_string());
         }
     }
+
+    // Rich Content (SVG) Demo
+    if let Some(cell) = grid.get_cell_mut(0, 2) {
+        // Use r##" (two hashes) so that fill="#..." doesn't close the string early
+        cell.svg_content = Some(r##"
+            <svg xmlns="http://www.w3.org/2000/svg" width="80" height="30">
+                <rect width="80" height="30" fill="#e0f7fa"/>
+                <text x="5" y="20" font-family="sans-serif" font-size="12" fill="#006064">Status: OK</text>
+            </svg>
+        "##.to_string());
+    }
+
+    if let Some(cell) = grid.get_cell_mut(1, 2) {
+        cell.svg_content = Some(r##"
+            <svg xmlns="http://www.w3.org/2000/svg" width="80" height="30">
+                <circle cx="15" cy="15" r="8" fill="#4caf50"/>
+                <text x="30" y="20" font-family="sans-serif" font-size="12" fill="#333">Active</text>
+            </svg>
+        "##.to_string());
+    }
 }

@@ -16,6 +16,15 @@ var<uniform> material: GridMaterial;
 @group(2) @binding(1)
 var<storage, read> cell_data: array<u32>;
 
+@group(2) @binding(2)
+var rich_cell_textures: texture_2d_array<f32>;
+
+@group(2) @binding(3)
+var rich_cell_sampler: sampler;
+
+@group(2) @binding(4)
+var<storage, read> rich_cell_indices: array<i32>;
+
 // --- BITMASK FONT LOGIC ---
 // 4x5 Pixel Font.
 var<private> FONT: array<u32, 10> = array<u32, 10>(
@@ -125,6 +134,28 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         // Selection highlight (blue tint)
         else if (is_selected) {
             final_color = mix(material.color_bg, vec4<f32>(0.2, 0.4, 0.8, 1.0), 0.5);
+        }
+    }
+
+    // Rich Content (SVG) Layer
+    if (col >= 0 && col < i32(material.grid_dimensions.x) &&
+        row >= 0 && row < i32(material.grid_dimensions.y)) {
+        
+        let cell_index = u32(row) * u32(material.grid_dimensions.x) + u32(col);
+        let texture_layer = rich_cell_indices[cell_index];
+
+        if (texture_layer >= 0) {
+            // Sample from texture array
+            // Note: cell_uv is (0,0) top-left to (1,1) bottom-right
+            let texture_color = textureSample(
+                rich_cell_textures,
+                rich_cell_sampler,
+                cell_uv,
+                texture_layer
+            );
+
+            // Alpha blend over background
+            final_color = mix(final_color, vec4<f32>(texture_color.rgb, 1.0), texture_color.a);
         }
     }
     

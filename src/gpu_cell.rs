@@ -15,6 +15,7 @@ impl GpuCell {
     pub const FLAG_SELECTED: u32 = 1 << 0; // Bit 0
     pub const FLAG_FORMULA: u32 = 1 << 1;  // Bit 1
     pub const FLAG_ERROR: u32 = 1 << 2;    // Bit 2
+    pub const FLAG_RICH: u32 = 1 << 3;     // Bit 3
 
     /// Convert a CPU Cell to GPU representation
     pub fn from_cell(cell: &Cell, selected: bool) -> Self {
@@ -28,6 +29,9 @@ impl GpuCell {
         }
         if cell.error {
             flags |= Self::FLAG_ERROR;
+        }
+        if cell.svg_content.is_some() {
+            flags |= Self::FLAG_RICH;
         }
 
         Self {
