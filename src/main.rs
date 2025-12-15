@@ -31,16 +31,17 @@ fn main() {
         Material2dPlugin::<SpreadsheetGridMaterial>::default(),
     ))
     .insert_resource({
-        let mut grid = GridState::new(GRID_COLS, GRID_ROWS);
+        let mut grid = GridState::new();
         demo::setup_demo_data(&mut grid);
         grid
     });
 
     app.insert_resource(SvgRenderer::new());
-
     app.insert_resource(DragState::default())
     .insert_resource(TickControl::default())
     .insert_resource(EvaluationTimer::default())
+    .insert_resource(EditingState::default())
+    .insert_resource(LensState::default())
     .add_systems(Startup, (setup, setup_ui))
     .add_systems(Update, (
         tick_evaluation_system,
@@ -48,17 +49,55 @@ fn main() {
         grid_interaction,
         handle_camera_buttons,
         handle_tick_buttons,
+        handle_lens_buttons,
         update_tick_button_text,
+        update_lens_button_text,
         handle_keyboard_input,
+        handle_editor_input,
+        update_editor_display,
         apply_camera_actions,
-        sync_grid_buffer
+        sync_grid_buffer,
+        manage_svg_cells
     ));
-
-    app.add_systems(Update, manage_svg_cells);
 
     app.run();
 }
 
+#[derive(Resource, Default)]
+struct EditingState {
+    pub active_cell: Option<(i32, i32)>,
+    pub buffer: String,
+}
+
+#[derive(Resource)]
+struct LensState {
+    pub show_value: bool,
+    pub show_position: bool,
+    pub show_formula: bool,
+    pub show_grid: bool,
+}
+
+impl Default for LensState {
+    fn default() -> Self {
+        Self {
+            show_value: true,
+            show_position: false,
+            show_formula: false,
+            show_grid: true,
+        }
+    }
+}
+
+#[derive(Component)]
+struct EditorText;
+
+#[derive(Component)]
+enum LensButton {
+    Value,
+    Position,
+    Formula,
+    Grid,
+}
 
 // Track drag state to toggle cells only once per drag
 #[derive(Resource, Default)]
@@ -84,6 +123,8 @@ struct SpreadsheetGridMaterial {
     color_line: LinearRgba,
     #[uniform(0)]
     grid_dimensions: Vec2,
+    #[uniform(0)]
+    show_grid: f32,
     #[storage(1, read_only)]
     cell_data: Handle<ShaderStorageBuffer>,
     #[texture(2, dimension = "2d_array")]
@@ -142,16 +183,14 @@ fn setup(
     mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    grid_state: Res<GridState>,
 ) {
     commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 0.0)));
 
-    let initial_data = grid_state.to_gpu_cells();
-    let buffer_handle = buffers.add(ShaderStorageBuffer::from(initial_data));
+    // Initialize with empty/dummy data, will be updated by sync_grid_buffer
+    let buffer_handle = buffers.add(ShaderStorageBuffer::from(vec![0u32]));
 
-    // Initialize rich cell indices with -1
-    let indices = vec![-1i32; (GRID_COLS * GRID_ROWS) as usize];
-    let indices_handle = buffers.add(ShaderStorageBuffer::from(indices));
+    // Initialize rich cell indices with -1 (small buffer initially)
+    let indices_handle = buffers.add(ShaderStorageBuffer::from(vec![-1i32]));
 
     // Initialize dummy texture array (1x1, 2 layers to force D2Array view)
     let dummy_texture = Image::new(
@@ -177,6 +216,7 @@ fn setup(
             color_bg: LinearRgba::WHITE,
             color_line: LinearRgba::gray(0.8),
             grid_dimensions: Vec2::new(GRID_COLS as f32, GRID_ROWS as f32),
+            show_grid: 1.0,
             cell_data: buffer_handle,
             rich_cell_textures: texture_handle,
             rich_cell_indices: indices_handle,
@@ -206,7 +246,7 @@ fn update_grid_to_camera(
         grid_transform.translation.y = center.y;
         grid_transform.scale = size.extend(1.0);
 
-        if let Some(mat) = materials.get_mut(grid_handle) {
+        if let Some(mat) = materials.get_mut(&grid_handle.0) {
             let bottom_left = Vec2::new(min.x.min(max.x), min.y.min(max.y));
 
             mat.viewport_bottom_left = bottom_left;
@@ -223,11 +263,12 @@ fn grid_interaction(
     mouse_btn: Res<ButtonInput<MouseButton>>,
     mut grid_state: ResMut<GridState>,
     mut drag_state: ResMut<DragState>,
+    mut editing_state: ResMut<EditingState>,
 ) {
     let Ok((camera, cam_transform)) = camera_q.single() else { return };
     let Ok(window) = window_q.single() else { return };
     let Ok(grid_handle) = grid_q.single() else { return };
-    let Some(mat) = materials.get(grid_handle) else { return };
+    let Some(mat) = materials.get(&grid_handle.0) else { return };
 
     // --- onMouseDown Handler ---
     if mouse_btn.just_pressed(MouseButton::Left) {
@@ -246,25 +287,28 @@ fn grid_interaction(
         if let Ok(world_pos) = camera.viewport_to_world_2d(cam_transform, cursor_pos) {
             let (col, row) = world_pos_to_cell(world_pos, mat.cell_size);
 
-            // Debug: print when clicking
             if mouse_btn.just_pressed(MouseButton::Left) {
-                println!("Click: cursor_pos={:?}, world_pos={:?}, cell=({}, {})", cursor_pos, world_pos, col, row);
+                // Select cell
+                grid_state.selected.clear();
+                grid_state.selected.insert((col, row));
+                
+                // Activate editing
+                editing_state.active_cell = Some((col, row));
+                if let Some(cell) = grid_state.get_cell(col, row) {
+                    editing_state.buffer = cell.raw.clone();
+                } else {
+                    editing_state.buffer = String::new();
+                }
             }
 
             // --- Toggle cells while dragging ---
-            if drag_state.is_dragging && col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS {
+            if drag_state.is_dragging {
                 let cell_coord = (col, row);
-
                 // Only toggle if we haven't toggled this cell yet during this drag
                 if !drag_state.toggled_cells.contains(&cell_coord) {
                     drag_state.toggled_cells.insert(cell_coord);
-
-                    // Toggle selection state
-                    if grid_state.selected.contains(&cell_coord) {
-                        grid_state.selected.remove(&cell_coord);
-                    } else {
-                        grid_state.selected.insert(cell_coord);
-                    }
+                    // Add to selection
+                    grid_state.selected.insert(cell_coord);
                 }
             }
         }
@@ -282,7 +326,7 @@ fn setup_ui(mut commands: Commands) {
             ..default()
         })
         .with_children(|parent| {
-            // Left panel - Zoom and Tick controls
+            // Left panel
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
@@ -293,17 +337,46 @@ fn setup_ui(mut commands: Commands) {
                     create_button(parent, "Zoom In (+)", CameraButton::ZoomIn);
                     create_button(parent, "Zoom Out (-)", CameraButton::ZoomOut);
                     create_button(parent, "Reset", CameraButton::Reset);
-
-                    // Separator
-                    parent.spawn(Node {
-                        height: Val::Px(20.0),
-                        ..default()
-                    });
-
-                    // Tick controls
+                    parent.spawn(Node { height: Val::Px(20.0), ..default() });
                     create_tick_button(parent, "Tick", TickButton::ManualTick);
                     create_tick_button(parent, "Auto Tick: OFF", TickButton::AutoTickToggle);
+                    
+                    parent.spawn(Node { height: Val::Px(20.0), ..default() });
+                    // Lens controls
+                    create_lens_button(parent, "Value: ON", LensButton::Value);
+                    create_lens_button(parent, "Pos: OFF", LensButton::Position);
+                    create_lens_button(parent, "Formula: OFF", LensButton::Formula);
+                    create_lens_button(parent, "Grid: ON", LensButton::Grid);
                 });
+
+            // Formula Bar (Top Center)
+            parent
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(150.0),
+                        top: Val::Px(10.0),
+                        width: Val::Px(400.0),
+                        height: Val::Px(40.0),
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Start,
+                        padding: UiRect::all(Val::Px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.1, 0.1, 0.1)), // Dark background
+                    BorderColor::from(Color::srgb(0.3, 0.3, 0.3)),
+                ))
+                .with_child((
+                    Text::new("Formula: "),
+                    TextFont { font_size: 16.0, ..default() },
+                    TextColor(Color::WHITE),
+                ))
+                .with_child((
+                    Text::new(""),
+                    TextFont { font_size: 16.0, ..default() },
+                    TextColor(Color::WHITE),
+                    EditorText,
+                ));
 
             // Right panel - Pan controls
             parent
@@ -315,7 +388,6 @@ fn setup_ui(mut commands: Commands) {
                 })
                 .with_children(|parent| {
                     create_button(parent, "Pan Up (^)", CameraButton::PanUp);
-
                     parent
                         .spawn(Node {
                             flex_direction: FlexDirection::Row,
@@ -326,7 +398,6 @@ fn setup_ui(mut commands: Commands) {
                             create_button(parent, "< Left", CameraButton::PanLeft);
                             create_button(parent, "Right >", CameraButton::PanRight);
                         });
-
                     create_button(parent, "Pan Down (v)", CameraButton::PanDown);
                 });
         });
@@ -380,11 +451,78 @@ fn create_tick_button(parent: &mut ChildSpawnerCommands, label: &str, button_typ
         ));
 }
 
+fn create_lens_button(parent: &mut ChildSpawnerCommands, label: &str, button_type: LensButton) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(120.0),
+                height: Val::Px(40.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.2, 0.2, 0.5)),
+            button_type,
+        ))
+        .with_child((
+            Text::new(label),
+            TextFont {
+                font_size: 14.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+        ));
+}
+
+fn handle_lens_buttons(
+    interaction_query: Query<(&Interaction, &LensButton), Changed<Interaction>>,
+    mut lens_state: ResMut<LensState>,
+    mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
+    grid_q: Query<&MeshMaterial2d<SpreadsheetGridMaterial>>,
+) {
+    for (interaction, button) in &interaction_query {
+        if *interaction == Interaction::Pressed {
+            match button {
+                LensButton::Value => lens_state.show_value = !lens_state.show_value,
+                LensButton::Position => lens_state.show_position = !lens_state.show_position,
+                LensButton::Formula => lens_state.show_formula = !lens_state.show_formula,
+                LensButton::Grid => {
+                    lens_state.show_grid = !lens_state.show_grid;
+                    if let Ok(grid_handle) = grid_q.single() {
+                        if let Some(mat) = materials.get_mut(&grid_handle.0) {
+                            mat.show_grid = if lens_state.show_grid { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn update_lens_button_text(
+    lens_state: Res<LensState>,
+    mut button_query: Query<(&LensButton, &Children)>,
+    mut text_query: Query<&mut Text>,
+) {
+    if !lens_state.is_changed() { return; }
+    for (button, children) in &mut button_query {
+        let text_val = match button {
+            LensButton::Value => format!("Value: {}", if lens_state.show_value { "ON" } else { "OFF" }),
+            LensButton::Position => format!("Pos: {}", if lens_state.show_position { "ON" } else { "OFF" }),
+            LensButton::Formula => format!("Formula: {}", if lens_state.show_formula { "ON" } else { "OFF" }),
+            LensButton::Grid => format!("Grid: {}", if lens_state.show_grid { "ON" } else { "OFF" }),
+        };
+        for child in children {
+            if let Ok(mut text) = text_query.get_mut(*child) {
+                **text = text_val.clone();
+            }
+        }
+    }
+}
+
 fn handle_camera_buttons(
-    interaction_query: Query<
-        (&Interaction, &CameraButton),
-        Changed<Interaction>,
-    >,
+    interaction_query: Query<(&Interaction, &CameraButton), Changed<Interaction>>,
     mut commands: Commands,
 ) {
     for (interaction, button_type) in &interaction_query {
@@ -404,10 +542,7 @@ fn handle_camera_buttons(
 }
 
 fn handle_tick_buttons(
-    interaction_query: Query<
-        (&Interaction, &TickButton),
-        Changed<Interaction>,
-    >,
+    interaction_query: Query<(&Interaction, &TickButton), Changed<Interaction>>,
     mut tick_control: ResMut<TickControl>,
 ) {
     for (interaction, button_type) in &interaction_query {
@@ -432,7 +567,6 @@ fn update_tick_button_text(
     if !tick_control.is_changed() {
         return;
     }
-
     for (button_type, children) in &mut button_query {
         if let TickButton::AutoTickToggle = button_type {
             for child in children {
@@ -452,40 +586,80 @@ fn handle_keyboard_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
 ) {
-    // Zoom controls: +/- or =/- keys
     if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
         commands.spawn(CameraAction::Zoom(0.8));
     }
     if keyboard.just_pressed(KeyCode::Minus) || keyboard.just_pressed(KeyCode::NumpadSubtract) {
         commands.spawn(CameraAction::Zoom(1.25));
     }
+    // Pan controls...
+    if keyboard.just_pressed(KeyCode::ArrowUp) { commands.spawn(CameraAction::Pan(Vec2::new(0.0, 100.0))); }
+    if keyboard.just_pressed(KeyCode::ArrowDown) { commands.spawn(CameraAction::Pan(Vec2::new(0.0, -100.0))); }
+    if keyboard.just_pressed(KeyCode::ArrowLeft) { commands.spawn(CameraAction::Pan(Vec2::new(-100.0, 0.0))); }
+    if keyboard.just_pressed(KeyCode::ArrowRight) { commands.spawn(CameraAction::Pan(Vec2::new(100.0, 0.0))); }
+}
 
-    // Pan controls: WASD
-    if keyboard.just_pressed(KeyCode::KeyW) {
-        commands.spawn(CameraAction::Pan(Vec2::new(0.0, 100.0)));
-    }
-    if keyboard.just_pressed(KeyCode::KeyS) {
-        commands.spawn(CameraAction::Pan(Vec2::new(0.0, -100.0)));
-    }
-    if keyboard.just_pressed(KeyCode::KeyA) {
-        commands.spawn(CameraAction::Pan(Vec2::new(-100.0, 0.0)));
-    }
-    if keyboard.just_pressed(KeyCode::KeyD) {
-        commands.spawn(CameraAction::Pan(Vec2::new(100.0, 0.0)));
+fn handle_editor_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut editing_state: ResMut<EditingState>,
+    mut grid_state: ResMut<GridState>,
+) {
+    if editing_state.active_cell.is_none() {
+        return;
     }
 
-    // Pan controls: Arrow keys
-    if keyboard.just_pressed(KeyCode::ArrowUp) {
-        commands.spawn(CameraAction::Pan(Vec2::new(0.0, 100.0)));
+    if keyboard.just_pressed(KeyCode::Enter) {
+        // Commit
+        if let Some((col, row)) = editing_state.active_cell {
+            grid_state.get_cell_mut_or_create(col, row).set_raw(editing_state.buffer.clone());
+        }
+        return;
     }
-    if keyboard.just_pressed(KeyCode::ArrowDown) {
-        commands.spawn(CameraAction::Pan(Vec2::new(0.0, -100.0)));
+
+    if keyboard.just_pressed(KeyCode::Backspace) {
+        editing_state.buffer.pop();
     }
-    if keyboard.just_pressed(KeyCode::ArrowLeft) {
-        commands.spawn(CameraAction::Pan(Vec2::new(-100.0, 0.0)));
+
+    // Basic key mapping for demo purposes
+    for key in keyboard.get_just_pressed() {
+        let char = match key {
+            KeyCode::KeyA => Some('A'),
+            KeyCode::KeyB => Some('B'),
+            KeyCode::KeyC => Some('C'),
+            KeyCode::KeyD => Some('D'),
+            KeyCode::Digit0 => Some('0'),
+            KeyCode::Digit1 => Some('1'),
+            KeyCode::Digit2 => Some('2'),
+            KeyCode::Digit3 => Some('3'),
+            KeyCode::Digit4 => Some('4'),
+            KeyCode::Digit5 => Some('5'),
+            KeyCode::Digit6 => Some('6'),
+            KeyCode::Digit7 => Some('7'),
+            KeyCode::Digit8 => Some('8'),
+            KeyCode::Digit9 => Some('9'),
+            KeyCode::Space => Some(' '),
+            KeyCode::Equal | KeyCode::NumpadEqual => Some('='),
+            KeyCode::NumpadAdd => Some('+'),
+            KeyCode::Minus | KeyCode::NumpadSubtract => Some('-'),
+            _ => None,
+        };
+        
+        if let Some(c) = char {
+            editing_state.buffer.push(c);
+        }
     }
-    if keyboard.just_pressed(KeyCode::ArrowRight) {
-        commands.spawn(CameraAction::Pan(Vec2::new(100.0, 0.0)));
+}
+
+fn update_editor_display(
+    editing_state: Res<EditingState>,
+    mut query: Query<&mut Text, With<EditorText>>,
+) {
+    for mut text in &mut query {
+        if let Some((col, row)) = editing_state.active_cell {
+            **text = format!("({}, {}): {}", col, row, editing_state.buffer);
+        } else {
+            **text = "Select a cell".to_string();
+        }
     }
 }
 
@@ -495,14 +669,10 @@ fn apply_camera_actions(
     mut commands: Commands,
 ) {
     let Ok(mut camera_transform) = camera_q.single_mut() else { return };
-
     for (entity, action) in &actions_q {
         match action {
-            CameraAction::Zoom(factor) => {
-                camera_transform.scale *= *factor;
-            }
+            CameraAction::Zoom(factor) => { camera_transform.scale *= *factor; }
             CameraAction::Pan(delta) => {
-                // Scale the pan delta by current zoom level
                 camera_transform.translation.x += delta.x * camera_transform.scale.x;
                 camera_transform.translation.y += delta.y * camera_transform.scale.y;
             }
@@ -511,48 +681,24 @@ fn apply_camera_actions(
                 camera_transform.scale = Vec3::ONE;
             }
         }
-
-        // Remove the action entity after processing
         commands.entity(entity).despawn();
     }
 }
 
 fn sync_grid_buffer(
     grid_state: Res<GridState>,
-    grid_q: Query<&MeshMaterial2d<SpreadsheetGridMaterial>>,
-    materials: Res<Assets<SpreadsheetGridMaterial>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-) {
-    if !grid_state.is_changed() { return; }
-
-    let Ok(grid_handle) = grid_q.single() else { return };
-    if let Some(mat) = materials.get(grid_handle) {
-        if let Some(buffer) = buffers.get_mut(&mat.cell_data) {
-            let gpu_data = grid_state.to_gpu_cells();
-            buffer.set_data(gpu_data.as_slice());
-        }
-    }
-}
-
-fn manage_svg_cells(
-    mut svg_renderer: ResMut<SvgRenderer>,
-    grid_state: Res<GridState>,
     camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     grid_q: Query<&MeshMaterial2d<SpreadsheetGridMaterial>>,
     mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
-    mut images: ResMut<Assets<Image>>,
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
-    mut last_visible_rich_cells: Local<Vec<(i32, i32)>>,
 ) {
     let Ok((camera, cam_transform)) = camera_q.single() else { return };
     let Ok(grid_handle) = grid_q.single() else { return };
-    let Some(mat) = materials.get_mut(grid_handle) else { return };
+    let Some(mat) = materials.get_mut(&grid_handle.0) else { return };
 
     let Some(rect) = camera.logical_viewport_rect() else { return };
     let min_world = camera.viewport_to_world_2d(cam_transform, rect.min).ok();
     let max_world = camera.viewport_to_world_2d(cam_transform, rect.max).ok();
-
-    let mut current_visible_rich_cells = Vec::new();
 
     if let (Some(min), Some(max)) = (min_world, max_world) {
         let bottom_left = Vec2::new(min.x.min(max.x), min.y.min(max.y));
@@ -563,33 +709,72 @@ fn manage_svg_cells(
         let min_row = (-top_right.y / mat.cell_size.y).floor() as i32;
         let max_row = (-bottom_left.y / mat.cell_size.y).ceil() as i32;
 
-        // Iterate visible cells
+        let width = max_col - min_col + 1;
+        let height = max_row - min_row + 1;
+
+        mat.grid_dimensions = Vec2::new(width as f32, height as f32);
+
+        if let Some(buffer) = buffers.get_mut(&mat.cell_data) {
+            let gpu_data = grid_state.to_gpu_cells_viewport(min_col, min_row, width, height);
+            buffer.set_data(gpu_data.as_slice());
+        }
+    }
+}
+
+fn manage_svg_cells(
+    mut svg_renderer: ResMut<SvgRenderer>,
+    grid_state: Res<GridState>,
+    lens_state: Res<LensState>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    grid_q: Query<&MeshMaterial2d<SpreadsheetGridMaterial>>,
+    mut materials: ResMut<Assets<SpreadsheetGridMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut last_visible_rich_cells: Local<Vec<(i32, i32)>>,
+) {
+    let Ok((camera, cam_transform)) = camera_q.single() else { return };
+    let Ok(grid_handle) = grid_q.single() else { return };
+    let Some(mat) = materials.get_mut(&grid_handle.0) else { return };
+
+    let Some(rect) = camera.logical_viewport_rect() else { return };
+    let min_world = camera.viewport_to_world_2d(cam_transform, rect.min).ok();
+    let max_world = camera.viewport_to_world_2d(cam_transform, rect.max).ok();
+
+    let mut current_visible_cells = Vec::new();
+    let mut min_col = 0;
+    let mut min_row = 0;
+    let mut width = 0;
+    let mut height = 0;
+
+    if let (Some(min), Some(max)) = (min_world, max_world) {
+        let bottom_left = Vec2::new(min.x.min(max.x), min.y.min(max.y));
+        let top_right = Vec2::new(min.x.max(max.x), min.y.max(max.y));
+
+        min_col = (bottom_left.x / mat.cell_size.x).floor() as i32;
+        let max_col = (top_right.x / mat.cell_size.x).ceil() as i32;
+        min_row = (-top_right.y / mat.cell_size.y).floor() as i32;
+        let max_row = (-bottom_left.y / mat.cell_size.y).ceil() as i32;
+        
+        width = max_col - min_col + 1;
+        height = max_row - min_row + 1;
+
         for row in min_row..=max_row {
             for col in min_col..=max_col {
-                if col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS {
-                    continue;
-                }
+                current_visible_cells.push((col, row));
                 
                 if let Some(cell) = grid_state.get_cell(col, row) {
-                     if let Some(svg) = &cell.svg_content {
-                         current_visible_rich_cells.push((col, row));
+                    let svg = generate_svg(cell, col, row, &lens_state);
+                    let hash = seahash::hash(svg.as_bytes());
 
-                         let hash = if let Some(h) = cell.content_hash {
-                             h
-                         } else {
-                             seahash::hash(svg.as_bytes())
-                         };
-
-                         if !svg_renderer.is_cached(hash) {
-                             svg_renderer.request_render(SvgRenderRequest {
-                                 cell_coord: (col, row),
-                                 svg: svg.clone(),
-                                 width: 80,
-                                 height: 30,
-                                 content_hash: hash,
-                             });
-                         }
-                     }
+                    if !svg_renderer.is_cached(hash) {
+                        svg_renderer.request_render(SvgRenderRequest {
+                            cell_coord: (col, row),
+                            svg,
+                            width: 80,
+                            height: 30,
+                            content_hash: hash,
+                        });
+                    }
                 }
             }
         }
@@ -598,57 +783,108 @@ fn manage_svg_cells(
     let results = svg_renderer.poll_results();
     let results_received = !results.is_empty();
     
-    // Sort to ensure stable order for comparison
-    current_visible_rich_cells.sort();
-
-    let visibility_changed = *last_visible_rich_cells != current_visible_rich_cells;
+    current_visible_cells.sort();
+    let visibility_changed = *last_visible_rich_cells != current_visible_cells;
 
     if results_received || visibility_changed {
-        *last_visible_rich_cells = current_visible_rich_cells.clone();
+        *last_visible_rich_cells = current_visible_cells.clone();
 
-        // Rebuild Texture2DArray
-        // Only include cells that are visible AND have cached data
         let mut texture_data = Vec::new();
-        let mut index_map = vec![-1i32; (GRID_COLS * GRID_ROWS) as usize];
+        let mut index_map = vec![-1i32; (width * height) as usize];
         let mut layer_count = 0;
+        let mut hash_to_layer = std::collections::HashMap::new();
 
-        for (col, row) in &current_visible_rich_cells {
+        for (col, row) in &current_visible_cells {
+            let rel_x = col - min_col;
+            let rel_y = row - min_row;
+            if rel_x < 0 || rel_x >= width || rel_y < 0 || rel_y >= height { continue; }
+            
+            let viewport_idx = (rel_y * width + rel_x) as usize;
+
             if let Some(cell) = grid_state.get_cell(*col, *row) {
-                if let Some(svg) = &cell.svg_content {
-                    let hash = cell.content_hash.unwrap_or_else(|| seahash::hash(svg.as_bytes()));
-                    
-                    if let Some(buffer) = svg_renderer.pixel_cache.get(&hash) {
-                         texture_data.extend_from_slice(buffer);
-                         
-                         let cell_idx = (row * GRID_COLS + col) as usize;
-                         index_map[cell_idx] = layer_count;
-                         layer_count += 1;
+                let svg = generate_svg(cell, *col, *row, &lens_state);
+                let hash = seahash::hash(svg.as_bytes());
+                
+                if let Some(buffer) = svg_renderer.pixel_cache.get(&hash) {
+                    if let Some(&existing_layer) = hash_to_layer.get(&hash) {
+                        index_map[viewport_idx] = existing_layer as i32;
+                    } else {
+                        texture_data.extend_from_slice(buffer);
+                        index_map[viewport_idx] = layer_count;
+                        hash_to_layer.insert(hash, layer_count);
+                        layer_count += 1;
                     }
                 }
             }
         }
 
-        // Always update index buffer
         if let Some(buffer) = buffers.get_mut(&mat.rich_cell_indices) {
              buffer.set_data(index_map.as_slice());
         }
 
         if layer_count > 0 {
+             // Force at least 2 layers to ensure D2Array view
+             let final_layer_count = if layer_count == 1 { 2 } else { layer_count };
+             if layer_count == 1 {
+                 // Pad with empty layer
+                 texture_data.resize(texture_data.len() * 2, 0);
+             }
+
              let texture_array = Image::new(
                 Extent3d {
                     width: 80,
                     height: 30,
-                    depth_or_array_layers: layer_count as u32,
+                    depth_or_array_layers: final_layer_count as u32,
                 },
                 TextureDimension::D2,
                 texture_data,
                 TextureFormat::Rgba8UnormSrgb,
-                RenderAssetUsages::RENDER_WORLD, // Only needed on GPU
+                RenderAssetUsages::RENDER_WORLD,
             );
-            
             mat.rich_cell_textures = images.add(texture_array);
-        } else {
-            // Keep dummy texture if no layers
         }
     }
+}
+
+fn generate_svg(cell: &crate::cell::Cell, col: i32, row: i32, lens_state: &LensState) -> String {
+    let mut elements = String::new();
+
+    // 1. Base Content (Value or Rich)
+    let is_rich = (col == 0 && row == 2) || (col == 1 && row == 2);
+    
+    if is_rich && lens_state.show_value {
+        // Use custom SVG body for rich cells
+        if col == 0 && row == 2 {
+            elements.push_str(r##"<rect width="80" height="30" fill="#e0f7fa"/><text x="5" y="20" font-family="sans-serif" font-size="12" fill="#006064">Status: OK</text>"##);
+        } else if col == 1 && row == 2 {
+            elements.push_str(r##"<circle cx="15" cy="15" r="8" fill="#4caf50"/><text x="30" y="20" font-family="sans-serif" font-size="12" fill="#333">Active</text>"##);
+        }
+    } else if lens_state.show_value {
+        // Default text rendering
+        let text = match &cell.value {
+            evalexpr::Value::Int(i) => i.to_string(),
+            evalexpr::Value::Float(f) => format!("{:.2}", f),
+            evalexpr::Value::String(s) => s.clone(),
+            evalexpr::Value::Boolean(b) => b.to_string(),
+            evalexpr::Value::Empty => "".to_string(),
+            evalexpr::Value::Tuple(_) => "Tuple".to_string(),
+        };
+        elements.push_str(&format!(r##"<text x="40" y="20" font-family="sans-serif" font-size="14" fill="black" text-anchor="middle">{}</text>"##, text));
+    }
+
+    // 2. Position Lens
+    if lens_state.show_position {
+        let coord_text = crate::formula::coord_to_name(col, row);
+        // Top-left, small light gray
+        elements.push_str(&format!(r##"<text x="2" y="8" font-family="sans-serif" font-size="8" fill="#aaaaaa">{}</text>"##, coord_text));
+    }
+
+    // 3. Formula Lens
+    if lens_state.show_formula && cell.is_formula {
+        // Bottom, small blue
+        let formula = cell.raw.replace("<", "<").replace(">", ">").replace("&", "&");
+        elements.push_str(&format!(r##"<text x="2" y="28" font-family="sans-serif" font-size="8" fill="blue">{}</text>"##, formula));
+    }
+
+    format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="30">{}</svg>"##, elements)
 }

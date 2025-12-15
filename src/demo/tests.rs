@@ -1,9 +1,10 @@
 use super::*;
 use crate::formula::{build_context, evaluate_formula};
+use evalexpr::Value;
 
 #[test]
 fn test_demo_data_setup() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Test counter setup
@@ -48,7 +49,7 @@ fn test_demo_data_setup() {
 
 #[test]
 fn test_counter_evaluation() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Initial state - counter should be 0
@@ -58,20 +59,20 @@ fn test_counter_evaluation() {
     let result = evaluate_formula(expr, &context).unwrap();
 
     // A0 is initially 0, so A0 + 1 = 1
-    assert_eq!(result, 1);
+    assert_eq!(result, Value::Int(1));
 }
 
 #[test]
 fn test_accumulator_evaluation() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Set values for accumulator literals
     if let Some(cell) = grid.get_cell_mut(2, 0) {
-        cell.value = 10;
+        cell.value = Value::Int(10);
     }
     if let Some(cell) = grid.get_cell_mut(2, 1) {
-        cell.value = 20;
+        cell.value = Value::Int(20);
     }
 
     let context = build_context(&grid);
@@ -79,20 +80,20 @@ fn test_accumulator_evaluation() {
     let expr = acc_sum.raw.trim_start().trim_start_matches('=').trim();
     let result = evaluate_formula(expr, &context).unwrap();
 
-    assert_eq!(result, 30);
+    assert_eq!(result, Value::Int(30));
 }
 
 #[test]
 fn test_fibonacci_evaluation() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Set initial Fibonacci values
     if let Some(cell) = grid.get_cell_mut(3, 0) {
-        cell.value = 1;
+        cell.value = Value::Int(1);
     }
     if let Some(cell) = grid.get_cell_mut(3, 1) {
-        cell.value = 1;
+        cell.value = Value::Int(1);
     }
 
     let context = build_context(&grid);
@@ -101,19 +102,19 @@ fn test_fibonacci_evaluation() {
     let fib3 = grid.get_cell(3, 2).unwrap();
     let expr = fib3.raw.trim_start().trim_start_matches('=').trim();
     let result = evaluate_formula(expr, &context).unwrap();
-    assert_eq!(result, 2);
+    assert_eq!(result, Value::Int(2));
 }
 
 #[test]
 fn test_blinker_evaluation() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Test with even counter value
     {
         // Set counter to even value
         if let Some(cell) = grid.get_cell_mut(0, 0) {
-            cell.value = 4;
+            cell.value = Value::Int(4);
         }
 
         let context = build_context(&grid);
@@ -122,20 +123,20 @@ fn test_blinker_evaluation() {
         let expr1 = grid.get_cell(1, 0).unwrap().raw.clone();
         let expr1 = expr1.trim_start().trim_start_matches('=').trim();
         let result1 = evaluate_formula(expr1, &context).unwrap();
-        assert_eq!(result1, 0);
+        assert_eq!(result1, Value::Int(0));
 
         // B1 = (A0 + 1) % 2 = 5 % 2 = 1
         let expr2 = grid.get_cell(1, 1).unwrap().raw.clone();
         let expr2 = expr2.trim_start().trim_start_matches('=').trim();
         let result2 = evaluate_formula(expr2, &context).unwrap();
-        assert_eq!(result2, 1);
+        assert_eq!(result2, Value::Int(1));
     }
 
     // Test with odd counter value
     {
         // Set counter to odd value
         if let Some(cell) = grid.get_cell_mut(0, 0) {
-            cell.value = 5;
+            cell.value = Value::Int(5);
         }
         let context = build_context(&grid);
 
@@ -143,19 +144,19 @@ fn test_blinker_evaluation() {
         let expr1 = grid.get_cell(1, 0).unwrap().raw.clone();
         let expr1 = expr1.trim_start().trim_start_matches('=').trim();
         let result1_odd = evaluate_formula(expr1, &context).unwrap();
-        assert_eq!(result1_odd, 1);
+        assert_eq!(result1_odd, Value::Int(1));
 
         // B1 = (A0 + 1) % 2 = 6 % 2 = 0
         let expr2 = grid.get_cell(1, 1).unwrap().raw.clone();
         let expr2 = expr2.trim_start().trim_start_matches('=').trim();
         let result2_odd = evaluate_formula(expr2, &context).unwrap();
-        assert_eq!(result2_odd, 0);
+        assert_eq!(result2_odd, Value::Int(0));
     }
 }
 
 #[test]
 fn test_all_digits_display() {
-    let mut grid = GridState::new(10, 10);
+    let mut grid = GridState::new();
     setup_demo_data(&mut grid);
 
     // Test that digits 0-9 are set up correctly

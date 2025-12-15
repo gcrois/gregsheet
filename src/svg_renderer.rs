@@ -7,13 +7,11 @@ use std::thread;
 pub struct SvgRenderer {
     request_tx: Sender<SvgRenderRequest>,
     result_rx: Receiver<SvgRenderResult>,
-    /// Maps cell coordinate to (layer_index, content_hash)
-    /// This tracks what is currently in the Texture2DArray
-    pub texture_layers: HashMap<(i32, i32), (usize, u64)>,
+
     /// Tracks pending render requests to avoid duplicates
     pub pending_renders: HashSet<(i32, i32)>,
+
     /// Caches rendered RGBA buffers by content hash
-    /// This allows us to rebuild the Texture2DArray without re-rendering
     pub pixel_cache: HashMap<u64, Vec<u8>>,
 }
 
@@ -45,7 +43,6 @@ impl SvgRenderer {
         Self {
             request_tx: req_tx,
             result_rx: res_rx,
-            texture_layers: HashMap::new(),
             pending_renders: HashSet::new(),
             pixel_cache: HashMap::new(),
         }
@@ -62,6 +59,7 @@ impl SvgRenderer {
         let mut results = Vec::new();
         while let Ok(res) = self.result_rx.try_recv() {
             self.pending_renders.remove(&res.cell_coord);
+            
             // Cache the result
             self.pixel_cache.insert(res.content_hash, res.rgba_buffer.clone());
             results.push(res);
@@ -75,12 +73,10 @@ impl SvgRenderer {
 }
 
 fn render_loop(rx: Receiver<SvgRenderRequest>, tx: Sender<SvgRenderResult>) {
-    // Re-use options and fontdb to avoid overhead
     let mut fontdb = usvg::fontdb::Database::new();
     fontdb.load_system_fonts();
 
     let mut options = usvg::Options::default();
-    // Enable font support if needed, though simple SVGs might not need it yet
     options.fontdb = std::sync::Arc::new(fontdb);
 
     while let Ok(req) = rx.recv() {
@@ -104,12 +100,6 @@ fn render_svg_to_buffer(svg_data: &str, width: u32, height: u32, options: &usvg:
         Ok(t) => t,
         Err(_) => return vec![0; (width * height * 4) as usize], // Return empty transparent buffer on error
     };
-
-    // Determine scaling to fit target dimensions
-    // We want to scale the SVG to fit within width x height, preserving aspect ratio?
-    // Or exactly fill? The task implies exactly filling 80x30.
-    // resvg renders to the size defined in the SVG unless scaled.
-    // We should compute a transform.
     
     let size = tree.size();
     let svg_width = size.width();
@@ -117,9 +107,7 @@ fn render_svg_to_buffer(svg_data: &str, width: u32, height: u32, options: &usvg:
     
     let scale_x = width as f32 / svg_width;
     let scale_y = height as f32 / svg_height;
-    // Use the smaller scale to fit entirely, or fill? 
-    // Grid cells are fixed 80x30. Let's assume the SVG is designed for that or we just scale to fit.
-    // Let's stretch to fill for now as cell backgrounds usually fill the cell.
+
     let transform = tiny_skia::Transform::from_scale(scale_x, scale_y);
 
     let mut pixmap = tiny_skia::Pixmap::new(width, height).unwrap();

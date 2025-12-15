@@ -65,35 +65,43 @@ pub fn tick_evaluation_system(
 
     // Phase 2: Evaluate all cells
     // Collect cells to avoid borrow checker issues
-    let cells_to_evaluate: Vec<(usize, String, bool)> = grid_state
+    // We store (col, row) as key
+    let cells_to_evaluate: Vec<((i32, i32), String, bool)> = grid_state
         .cells
         .iter()
-        .enumerate()
-        .map(|(idx, cell)| (idx, cell.raw.clone(), cell.is_formula))
+        .map(|(key, cell)| (*key, cell.raw.clone(), cell.is_formula))
         .collect();
 
-    for (idx, raw, is_formula) in cells_to_evaluate {
-        let cell = &mut grid_state.cells[idx];
+    for (key, raw, is_formula) in cells_to_evaluate {
+        // We can use get_mut because we hold the key and grid_state is ResMut
+        // But we need to use 'if let Some' just in case, though keys came from it.
+        if let Some(cell) = grid_state.cells.get_mut(&key) {
+            if is_formula {
+                // Strip leading '=' and whitespace
+                let expr = raw.trim_start().trim_start_matches('=').trim();
 
-        if is_formula {
-            // Strip leading '=' and whitespace
-            let expr = raw.trim_start().trim_start_matches('=').trim();
-
-            match evaluate_formula(expr, &context) {
-                Ok(new_value) => {
-                    cell.value = new_value;
-                    cell.error = false;
+                match evaluate_formula(expr, &context) {
+                    Ok(new_value) => {
+                        cell.value = new_value;
+                        cell.error = false;
+                    }
+                    Err(_) => {
+                        cell.error = true;
+                        cell.value = evalexpr::Value::Int(0);
+                    }
                 }
-                Err(_) => {
-                    cell.error = true;
-                    cell.value = 0;
+            } else {
+                // Parse literal value
+                // Try to parse as number first (Int or Float), else String
+                if let Ok(i) = raw.trim().parse::<i64>() {
+                    cell.value = evalexpr::Value::Int(i);
+                } else if let Ok(f) = raw.trim().parse::<f64>() {
+                    cell.value = evalexpr::Value::Float(f);
+                } else {
+                    cell.value = evalexpr::Value::String(raw.clone());
                 }
+                cell.error = false;
             }
-        } else {
-            // Parse literal value
-            let new_value = raw.trim().parse::<i64>().unwrap_or(0);
-            cell.value = new_value;
-            cell.error = false;
         }
     }
 

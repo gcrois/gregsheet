@@ -26,37 +26,24 @@ pub fn coord_to_name(col: i32, row: i32) -> String {
 pub fn build_context(grid: &GridState) -> HashMapContext {
     let mut context = HashMapContext::new();
 
-    for row in 0..grid.rows {
-        for col in 0..grid.cols {
-            let var_name = coord_to_name(col, row);
-            let value = grid
-                .get_cell(col, row)
-                .map(|cell| cell.value)
-                .unwrap_or(0);
+    for ((col, row), cell) in &grid.cells {
+        let var_name = coord_to_name(*col, *row);
+        let value = cell.value.clone();
 
-            // Set the variable in the context
-            let _ = context.set_value(var_name, Value::Int(value));
-        }
+        // Set the variable in the context
+        let _ = context.set_value(var_name, value);
     }
 
     context
 }
 
 /// Evaluate a formula expression (without the leading '=')
-/// Returns the i64 result or an error if evaluation fails
+/// Returns the Value result or an error if evaluation fails
 pub fn evaluate_formula(
     expr: &str,
     context: &HashMapContext,
-) -> Result<i64, evalexpr::EvalexprError> {
-    let result = evalexpr::eval_with_context(expr, context)?;
-
-    // Convert result to i64
-    match result {
-        Value::Int(i) => Ok(i),
-        Value::Float(f) => Ok(f as i64),
-        Value::Boolean(b) => Ok(if b { 1 } else { 0 }),
-        _ => Ok(0),
-    }
+) -> Result<Value, evalexpr::EvalexprError> {
+    evalexpr::eval_with_context(expr, context)
 }
 
 #[cfg(test)]
